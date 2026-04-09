@@ -47,7 +47,7 @@ const State = (() => {
   function _loadBookings() {
     try {
       return JSON.parse(localStorage.getItem('beauty_bookings') || '[]');
-    } catch {
+    } catch (e) {
       return [];
     }
   }
@@ -55,7 +55,7 @@ const State = (() => {
   function _saveBookings() {
     try {
       localStorage.setItem('beauty_bookings', JSON.stringify(_state.bookings));
-    } catch { /* ignore */ }
+    } catch (e) { /* ignore */ }
   }
 
   // ─── Методы ───────────────────────────────────────────────────────────────
