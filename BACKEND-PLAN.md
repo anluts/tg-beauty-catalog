@@ -3,7 +3,8 @@
 > Архитектурный план бэкенда для Beauty Master Platform  
 > Стек: Supabase (PostgreSQL + Storage) + Vercel Serverless Functions + YooKassa + Telegram Bot API  
 > Составлен на основе: research.md, brief.md, текущего кода проекта  
-> **v2** — исправлены: race condition бронирования, multi-tenant routing, auth flow, webhook security, weekday bug
+> **v2** — исправлены: race condition бронирования, multi-tenant routing, auth flow, webhook security, weekday bug  
+> **v3** — зафиксированы решения: хостинг, admin-панель, уведомления
 
 ---
 
@@ -975,7 +976,75 @@ if (!MASTER_ID) {
 
 ---
 
-## 14. Что намеренно не вошло в текущий план (но нужно до production)
+## 14. Admin-панель владельца платформы
+
+### Решение: статическая веб-страница + Telegram Login + уведомления в бот
+
+**Что видно на странице:**
+- Количество мастеров (всего / активные за 30 дней)
+- Выручка за текущий месяц (сумма платежей `subscriptions` со статусом `succeeded`)
+- Активные подписки (мастера с `plan = 'pro'` и `plan_expires_at > now()`)
+- Сколько всего подписчиков было за всё время
+- Таблица мастеров: имя, бот, план, дата регистрации, количество клиентов
+
+**Защита:** Telegram Login Widget — вход через Telegram-кнопку. Бэкенд проверяет что `telegram_id` совпадает с `PLATFORM_ADMIN_ID` в env. Не нужен пароль.
+
+**Уведомления при оплате:** платформенный бот (`PLATFORM_BOT_TOKEN`) пишет в личку:
+```
+💳 Новая оплата!
+Мастер: Анна Иванова (@anna_bot)
+Тариф: Pro на 1 месяц
+Сумма: 990 ₽
+YooKassa ID: 2a56...
+```
+
+### API для admin-панели
+
+```
+GET /api/admin/stats
+```
+Защита: Telegram Login (заголовок `X-Telegram-Id` + подпись виджета).  
+Ответ: все метрики одним запросом.
+
+```
+GET /api/admin/masters
+```
+Список мастеров с пагинацией.
+
+### Переменные окружения (добавить)
+
+```env
+PLATFORM_ADMIN_ID=   # твой telegram_id (число), только он видит admin-панель
+```
+
+### Порядок разработки admin-панели (после Этапа 4 — монетизации)
+
+1. Добавить `PLATFORM_ADMIN_ID` в env
+2. Создать `GET /api/admin/stats` с проверкой telegram_id
+3. Написать простую HTML-страницу `admin/index.html` (Telegram Login Widget → fetch `/api/admin/stats` → рендер таблиц)
+4. В webhook YooKassa при `succeeded` → отправить сообщение в личку через `PLATFORM_BOT_TOKEN`
+
+---
+
+## 15. Решения по хостингу и домену
+
+| Вопрос | Решение |
+|--------|---------|
+| **Где API** | Vercel Serverless Functions (старт) → VPS (когда упрёмся в лимиты или цену) |
+| **Где база данных** | Supabase (PostgreSQL + Storage) — остаётся всегда |
+| **Домен** | Купить один домен для платформы (например `beautymaster.ru`). API будет на `api.beautymaster.ru`, admin — на `admin.beautymaster.ru` |
+| **Когда VPS** | Когда станет выгоднее по цене (~50+ мастеров на Pro) или понадобятся cron-задачи каждую минуту |
+| **Провайдер VPS** | Timeweb Cloud или Hetzner (есть в России, хорошее соотношение цена/качество) |
+
+### Что нужно сделать с доменом (когда купишь)
+1. Купить домен (reg.ru, nic.ru, namecheap.com)
+2. В DNS добавить: `api` → Vercel, `admin` → Vercel (или отдельный VPS)
+3. Vercel автоматически выдаёт SSL-сертификат
+4. Шаги объясню подробно когда дойдём до этого момента
+
+---
+
+## 16. Что намеренно не вошло в текущий план (но нужно до production)
 
 | Тема | Почему важно | Когда добавлять |
 |------|-------------|-----------------|
