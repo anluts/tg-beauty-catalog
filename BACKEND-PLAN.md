@@ -2,7 +2,8 @@
 
 > Архитектурный план бэкенда для Beauty Master Platform  
 > Стек: Supabase (PostgreSQL + Storage) + Vercel Serverless Functions + YooKassa + Telegram Bot API  
-> Составлен на основе: research.md, brief.md, текущего кода проекта
+> Составлен на основе: research.md, brief.md, текущего кода проекта  
+> **v2** — исправлены: race condition бронирования, multi-tenant routing, auth flow, webhook security, weekday bug
 
 ---
 
@@ -11,25 +12,28 @@
 Платформа — это SaaS-конструктор для мастеров красоты. Один мастер = один экземпляр Mini App, который работает под его Telegram-ботом. Клиенты мастера видят только его данные.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   ПЛАТФОРМА                         │
-│                                                     │
-│  Мастер А          Мастер Б          Мастер В       │
-│  @bot_a            @bot_b            @bot_c         │
-│  beauty-a.vercel   beauty-b.vercel   beauty-c.vercel│
-│  5 услуг (free)    безлимит (pro)    безлимит (pro) │
-└─────────────────────────────────────────────────────┘
-                         │
-              ┌──────────▼──────────┐
-              │     Supabase DB     │
-              │   + Storage (S3)   │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │  Vercel API Routes  │
-              │  /api/*             │
-              └─────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        ПЛАТФОРМА                             │
+│                                                              │
+│  Мастер А (@bot_a)   Мастер Б (@bot_b)   Мастер В (@bot_c)  │
+│  t.me/bot_a?startapp=MASTER_ID_A  ...                        │
+│  5 услуг (free)      безлимит (pro)       безлимит (pro)     │
+└───────────────────────────┬──────────────────────────────────┘
+                            │ один общий деплой
+          ┌─────────────────▼─────────────────┐
+          │       beauty-catalog.vercel.app    │
+          │       Vercel API Routes /api/*     │
+          │   (читает master_id из startParam) │
+          └─────────────────┬─────────────────┘
+                            │
+          ┌─────────────────▼─────────────────┐
+          │           Supabase DB              │
+          │       + Storage (S3)              │
+          │   RLS изолирует данных мастеров   │
+          └───────────────────────────────────┘
 ```
+
+**Важно: один Vercel-проект для всей платформы.** Каждый мастер получает ссылку вида `t.me/его_бот?startapp=MASTER_UUID`. Фронтенд читает `startParam` при открытии и делает все API-запросы с этим `master_id`. Отдельные деплои на мастера — операционный кошмар (100 мастеров = 100 проектов на Vercel).
 
 ---
 
@@ -41,7 +45,12 @@
 | **client** | Клиент мастера | Просматривать каталог, записываться, смотреть свои записи |
 | **platform_admin** | Ты (Александр) | Видеть всех мастеров, управлять тарифами, выплатами |
 
-**Идентификация через Telegram** — не нужна отдельная авторизация. Все запросы содержат `initData` из `Telegram.WebApp.initData`, который проверяется на бэкенде подписью HMAC-SHA256.
+**Идентификация через Telegram + JWT:**
+- При открытии Mini App → `POST /api/auth/init` с `initData` из `Telegram.WebApp.initData`
+- Бэкенд проверяет `initData` через HMAC-SHA256 **один раз** и выдаёт JWT (TTL 24ч)
+- Все последующие запросы идут с заголовком `Authorization: Bearer <jwt>` — initData больше не нужен
+- JWT содержит `{ telegram_id, role: 'master'|'client', master_id }` в payload
+- При 401 — фронтенд повторяет `/api/auth/init` и получает свежий токен
 
 ---
 
@@ -247,12 +256,22 @@ CREATE TABLE bookings (
   cancelled_by  TEXT,               -- 'client' | 'master'
   cancel_reason TEXT,
   
+  -- Soft delete: запись не удаляется физически, только помечается
+  deleted_at    TIMESTAMPTZ,
+  
   created_at    TIMESTAMPTZ DEFAULT now(),
-  updated_at    TIMESTAMPTZ DEFAULT now()
+  updated_at    TIMESTAMPTZ DEFAULT now(),
+
+  -- КРИТИЧНО: защита от двойного бронирования на уровне БД
+  -- Уникальность: один мастер не может иметь два confirmed-бронирования на одно время
+  CONSTRAINT unique_master_slot UNIQUE (master_id, date, time_start)
 );
 
 CREATE INDEX idx_bookings_master_date ON bookings(master_id, date);
 CREATE INDEX idx_bookings_client ON bookings(client_id);
+-- Частичный индекс: ищем только активные записи (не отменённые/не завершённые)
+CREATE INDEX idx_bookings_active ON bookings(master_id, date, time_start)
+  WHERE status NOT IN ('cancelled', 'rejected') AND deleted_at IS NULL;
 ```
 
 ### 3.9 Таблица `reviews`
@@ -336,14 +355,43 @@ beauty-master/
 ```
 POST /api/auth/init
 ```
-Вызывается при каждом открытии Mini App. Передаёт `initData` из Telegram.  
-**Ответ:** JWT токен + данные мастера (если `telegram_id` = мастер) или клиента.
+Вызывается **один раз** при открытии Mini App. Передаёт `initData` из `Telegram.WebApp.initData`.
+
+Тело запроса:
+```json
+{
+  "initData": "query_id=...&user=...&hash=...",
+  "master_id": "uuid-мастера-из-startParam"
+}
+```
+
+Логика на бэкенде:
+1. Найти мастера по `master_id` → получить его `bot_token` (расшифровать из БД)
+2. Проверить подпись `initData` через HMAC-SHA256 с этим `bot_token`
+3. Если мастер пишет к своему же боту (`telegram_id` совпадает с `masters.telegram_id`) → роль `master`
+4. Иначе → роль `client`, создать/обновить запись в `clients`
+5. Вернуть JWT с TTL 24ч
+
+**Ответ:**
+```json
+{
+  "token": "eyJhbGci...",
+  "role": "client",
+  "master": { "id": "...", "name": "...", "theme": "rose", "app_name": "..." },
+  "client": { "id": "...", "first_name": "Алёна" }
+}
+```
+
+> Все последующие запросы: `Authorization: Bearer <token>`. initData больше **не нужен**.
 
 ```
 POST /api/auth/master-setup
 ```
-Первичная настройка мастера. Вызывается ботом при `/start`.  
-Тело: `{ bot_token, telegram_id, first_name }`.
+Первичная настройка мастера. Вызывается **ботом платформы** (не Mini App) при `/start`.  
+Тело: `{ bot_token, telegram_id, first_name }`.  
+Создаёт запись в `masters`, возвращает `master_id`.  
+После этого бот платформы отправляет мастеру его персональную ссылку:  
+`t.me/его_бот?startapp=MASTER_UUID`.
 
 ### 5.2 Публичные данные (видят клиенты)
 
@@ -464,9 +512,34 @@ Webhook от YooKassa. При `succeeded` — обновляет `masters.plan =
 ### 5.6 Telegram Bot Webhook
 
 ```
-POST /api/telegram/webhook/{bot_token}
+POST /api/telegram/webhook
 ```
 Обрабатывает все апдейты от Telegram-бота мастера.
+
+**Безопасность: bot_token НЕ идёт в URL** (он попадает в логи Vercel/CDN).  
+Вместо этого используем механизм Telegram `secret_token`:
+
+```javascript
+// При регистрации webhook для каждого бота мастера:
+await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+  method: 'POST',
+  body: JSON.stringify({
+    url: 'https://beauty-catalog.vercel.app/api/telegram/webhook',
+    secret_token: crypto.randomBytes(32).toString('hex'),  // сохраняем в masters.webhook_secret
+  })
+});
+
+// В /api/telegram/webhook:
+const secret = req.headers['x-telegram-bot-api-secret-token'];
+const master = await db.masters.findOne({ webhook_secret: secret });
+if (!master) return res.status(403).end();
+// Дальше обрабатываем update от имени этого мастера
+```
+
+Добавить в таблицу `masters`:
+```sql
+webhook_secret TEXT UNIQUE,  -- случайный 32-байтный hex, устанавливается при регистрации бота
+```
 
 ---
 
@@ -596,25 +669,28 @@ if (master.plan === 'free' && serviceCount.count >= 5) {
 ## 10. Генерация слотов (логика)
 
 ```javascript
-function generateAvailableSlots(date, masterId) {
-  // 1. Получить расписание мастера на этот weekday
-  const weekday = new Date(date).getDay(); // 0=Вс, ..., 6=Сб
-  const daySchedule = await getSchedule(masterId, weekday);
-  if (!daySchedule.is_working) return [];
+// ИСПРАВЛЕНО: функция async, weekday конвертирован правильно
+async function generateAvailableSlots(date, masterId, serviceDuration) {
+  // 1. Получить weekday в формате БД (0=Пн ... 6=Вс)
+  // JS getDay() возвращает 0=Вс, 1=Пн ... 6=Сб — нужна конвертация!
+  const jsDay = new Date(date).getDay();          // 0=Вс
+  const weekday = jsDay === 0 ? 6 : jsDay - 1;   // 0=Пн, 6=Вс — как в таблице schedule
 
-  // 2. Проверить override (отпуск, выходной)
+  // 2. Получить расписание на этот день
+  const daySchedule = await getSchedule(masterId, weekday);
+  if (!daySchedule || !daySchedule.is_working) return [];
+
+  // 3. Проверить override (отпуск, выходной)
   const override = await getOverride(masterId, date);
   if (override && !override.is_working) return [];
 
-  // 3. Сгенерировать все слоты от start_time до end_time
-  const slots = generateTimeSlots(
-    override?.start_time || daySchedule.start_time,
-    override?.end_time || daySchedule.end_time,
-    60 // минут на слот (или service.duration)
-  );
+  // 4. Сгенерировать все слоты от start_time до end_time
+  const startTime = override?.start_time || daySchedule.start_time;
+  const endTime   = override?.end_time   || daySchedule.end_time;
+  const slots = generateTimeSlots(startTime, endTime, serviceDuration);
 
-  // 4. Убрать занятые (уже есть booking на это время)
-  const existingBookings = await getBookings(masterId, date);
+  // 5. Убрать занятые (статусы pending/confirmed занимают время)
+  const existingBookings = await getBookings(masterId, date, ['pending', 'confirmed']);
   return slots.map(slot => ({
     time: slot,
     available: !existingBookings.some(b =>
@@ -622,13 +698,39 @@ function generateAvailableSlots(date, masterId) {
     )
   }));
 }
+
+// Вспомогательная: генерирует массив времён ["10:00", "11:30", ...]
+function generateTimeSlots(startTime, endTime, durationMinutes) {
+  const slots = [];
+  let [h, m] = startTime.split(':').map(Number);
+  const [endH, endM] = endTime.split(':').map(Number);
+  const endTotal = endH * 60 + endM;
+
+  while (h * 60 + m + durationMinutes <= endTotal) {
+    slots.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
+    m += durationMinutes;
+    h += Math.floor(m / 60);
+    m = m % 60;
+  }
+  return slots;
+}
+
+// Вспомогательная: проверяет пересечение двух временных отрезков
+function timeOverlaps(slotStart, slotDuration, bookStart, bookEnd) {
+  const toMin = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+  const sS = toMin(slotStart);
+  const sE = sS + slotDuration;
+  const bS = toMin(bookStart);
+  const bE = toMin(bookEnd);
+  return sS < bE && sE > bS;  // стандартная проверка пересечения отрезков
+}
 ```
 
 ---
 
 ## 11. Безопасность
 
-### Проверка initData (обязательно на каждый запрос)
+### 11.1 Проверка initData (только в /api/auth/init)
 
 ```javascript
 function verifyTelegramInitData(initData, botToken) {
@@ -647,16 +749,117 @@ function verifyTelegramInitData(initData, botToken) {
   const expectedHash = crypto.createHmac('sha256', secretKey)
     .update(dataCheckString).digest('hex');
 
+  // Дополнительно: проверяем что auth_date не старше 24ч
+  const authDate = parseInt(data.get('auth_date'));
+  const age = Math.floor(Date.now() / 1000) - authDate;
+  if (age > 86400) return false; // просрочено
+
   return hash === expectedHash;
 }
 ```
 
-### Правила Row Level Security (Supabase RLS)
+### 11.2 JWT middleware (для всех остальных роутов)
 
-- Мастер видит только своих клиентов и свои записи
-- Клиент видит только свои записи
-- Фото услуг — публичное чтение, запись только через API с проверкой master_id
-- Токены ботов хранятся зашифрованными (AES-256), ключ в env
+```javascript
+// middleware/auth.js
+import jwt from 'jsonwebtoken';
+
+export function requireAuth(handler) {
+  return async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'UNAUTHORIZED' });
+    }
+    try {
+      const payload = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
+      req.user = payload; // { telegram_id, role, master_id, client_id }
+      return handler(req, res);
+    } catch {
+      return res.status(401).json({ error: 'TOKEN_EXPIRED' });
+    }
+  };
+}
+
+// Пример использования в роуте:
+export default requireAuth(async (req, res) => {
+  const { master_id } = req.user;
+  // ...
+});
+```
+
+Добавить в `.env`:
+```env
+JWT_SECRET=   # случайная строка ≥ 64 символа
+JWT_TTL=86400 # 24 часа в секундах
+```
+
+### 11.3 Защита от двойного бронирования (concurrency)
+
+Ключевая проблема: два клиента одновременно выбирают один слот.  
+Решение — два уровня защиты:
+
+**Уровень 1 (БД):** UNIQUE constraint `(master_id, date, time_start)` в таблице `bookings`.
+
+**Уровень 2 (API):** При создании записи — `INSERT ... ON CONFLICT DO NOTHING` + проверка результата:
+
+```javascript
+// POST /api/bookings
+const { data, error } = await supabase
+  .from('bookings')
+  .insert({
+    master_id, client_id, service_id,
+    date, time_start, time_end,
+    service_name, price,
+    client_name, client_phone, comment,
+    status: 'pending',
+  })
+  .select()
+  .single();
+
+// Если вставка не прошла из-за конфликта (другой клиент занял слот):
+if (!data) {
+  return res.status(409).json({
+    error: 'SLOT_TAKEN',
+    message: 'Этот слот только что заняли. Выберите другое время.',
+  });
+}
+// Иначе — бронирование создано, уведомляем мастера
+```
+
+**Уровень 3 (UX):** Фронтенд при получении 409 автоматически обновляет слоты (`GET /api/master/{id}/slots`) и показывает сообщение.
+
+### 11.4 Правила Row Level Security (Supabase RLS)
+
+> RLS в Supabase работает на уровне PostgreSQL. API использует `SUPABASE_SERVICE_ROLE_KEY` (обходит RLS), поэтому сама изоляция данных реализована в логике API-роутов, а не в RLS-политиках. RLS — дополнительный слой защиты на случай прямого доступа к БД.
+
+- Мастер видит только свои `services`, `bookings`, `clients` через `master_id`
+- Клиент видит только свои `bookings` через `client_id`
+- `service_photos`, `portfolio_photos` — публичное чтение (SELECT), запись только через API с проверкой `master_id`
+- `bot_token` и `webhook_secret` — никогда не отдаются клиенту (SELECT policy исключает эти колонки)
+- Токены ботов хранятся зашифрованными (AES-256-GCM), ключ в `ENCRYPTION_KEY` env
+
+```javascript
+// Шифрование bot_token перед сохранением в БД:
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+
+const ALGO = 'aes-256-gcm';
+const KEY = Buffer.from(process.env.ENCRYPTION_KEY, 'hex'); // 32 байта
+
+function encrypt(text) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(ALGO, KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, encrypted].map(b => b.toString('hex')).join(':');
+}
+
+function decrypt(stored) {
+  const [ivHex, tagHex, encHex] = stored.split(':');
+  const decipher = createDecipheriv(ALGO, KEY, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  return decipher.update(Buffer.from(encHex, 'hex')) + decipher.final('utf8');
+}
+```
 
 ---
 
@@ -667,47 +870,118 @@ function verifyTelegramInitData(initData, botToken) {
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=    # только на бэкенде, никогда в клиент
 
+# JWT
+JWT_SECRET=                   # случайная строка ≥ 64 символа (openssl rand -hex 64)
+JWT_TTL=86400                 # TTL токена в секундах (24ч)
+
 # YooKassa
 YOOKASSA_SHOP_ID=
 YOOKASSA_SECRET_KEY=
 
-# Шифрование токенов ботов
-ENCRYPTION_KEY=               # 32-байтный ключ AES-256
+# Шифрование токенов ботов в БД (AES-256-GCM)
+ENCRYPTION_KEY=               # 32-байтный hex (openssl rand -hex 32)
 
 # Платформа
 PLATFORM_BOT_TOKEN=           # Telegram бот самой платформы (для онбординга мастеров)
 PLAN_PRO_PRICE_RUB=990
+
+# Vercel (для локальной разработки через proxy)
+# HTTPS_PROXY=http://191.102.148.189:9842
 ```
 
 ---
 
 ## 13. Порядок разработки (этапы)
 
+### Этап 0 — Multi-tenant routing (делается ДО любого API)
+
+Фронтенд должен знать с каким мастером работает. Это решается один раз и не меняется.
+
+**Как фронтенд получает master_id:**
+```javascript
+// tg-app/js/app.js — самый первый код при инициализации
+function getMasterId() {
+  // 1. Telegram передаёт startParam при открытии t.me/bot?startapp=MASTER_UUID
+  const startParam = window.Telegram?.WebApp?.initDataUnsafe?.start_param;
+  if (startParam && startParam.match(/^[0-9a-f-]{36}$/)) return startParam;
+
+  // 2. Fallback для локальной разработки: URL параметр ?master=UUID
+  const urlParam = new URLSearchParams(location.search).get('master');
+  if (urlParam) return urlParam;
+
+  // 3. Если нет master_id — показываем заглушку «Откройте приложение через бот»
+  return null;
+}
+
+const MASTER_ID = getMasterId();
+if (!MASTER_ID) {
+  document.getElementById('app-shell').innerHTML =
+    '<div style="padding:24px;text-align:center">Откройте приложение через бота мастера</div>';
+} else {
+  init(); // запускаем приложение
+}
+```
+
+**Как мастер получает свою ссылку:**  
+При регистрации через бот платформы → бот отвечает:
+```
+✅ Ваше приложение готово!
+Ссылка для клиентов: t.me/ваш_бот?startapp=550e8400-e29b-41d4-a716-446655440000
+```
+
 ### Этап 1 — Фундамент (без него ничего не работает)
-1. Supabase: создать все таблицы, настроить RLS
-2. `POST /api/auth/init` — проверка initData, выдача JWT
-3. `POST /api/auth/master-setup` — регистрация мастера через бота
-4. `GET /api/master/{id}/services` — отдать услуги в Mini App
-5. Telegram webhook: команда `/start` с кнопкой Mini App
+
+1. Supabase: создать все таблицы (включая `webhook_secret` в `masters`), настроить RLS
+2. `POST /api/auth/init` — проверка initData, определение роли, выдача JWT
+3. Middleware `requireAuth` — проверка JWT для всех роутов кроме `/api/auth/*`
+4. `POST /api/auth/master-setup` — регистрация мастера через бота платформы
+5. `GET /api/master/{id}/services` — отдать услуги в Mini App (использует JWT)
+6. `GET /api/master/{id}/profile` — профиль мастера (тема, имя, аватар для White Label)
+7. Telegram webhook бота платформы: команда `/start` → онбординг → выдача `master_id`
+8. Telegram webhook каждого бота мастера: via `X-Telegram-Bot-Api-Secret-Token`
 
 ### Этап 2 — Записи
-6. `GET /api/master/{id}/slots` — генерация слотов по расписанию
-7. `POST /api/bookings` — создать запись + уведомить мастера в бот
-8. `GET /api/bookings/my` — список записей клиента
-9. `PATCH /api/bookings/{id}/cancel` — отмена
+
+9. `GET /api/master/{id}/slots?date=&service_id=` — генерация слотов (исправленный weekday)
+10. `POST /api/bookings` — создать запись + `ON CONFLICT DO NOTHING` + уведомить мастера
+11. `GET /api/bookings/my` — список записей клиента (по `client_id` из JWT)
+12. `PATCH /api/bookings/{id}/cancel` — отмена (проверяем что `>24ч` до записи)
+13. Фронтенд: обработка `409 SLOT_TAKEN` → автообновление слотов + сообщение пользователю
 
 ### Этап 3 — Кабинет мастера в Mini App
-10. Новые экраны: дашборд, управление услугами, расписание
-11. `POST /api/master/me/services` + загрузка фото
-12. `PUT /api/master/me/schedule`
-13. `PATCH /api/master/me/bookings/{id}/confirm|reject`
+
+14. Фронтенд: роутинг по роли — если `role === 'master'` в JWT → показываем кабинет
+15. Новые экраны: дашборд (записи сегодня/завтра), управление услугами, расписание, записи
+16. `POST /api/master/me/services` + проверка лимита (5 на free)
+17. `POST /api/master/me/services/{id}/photos` — загрузка в Supabase Storage
+18. `PUT /api/master/me/schedule` — расписание по дням
+19. `POST /api/master/me/schedule/override` — выходные/отпуск
+20. `PATCH /api/master/me/bookings/{id}/confirm|reject|complete`
+21. Telegram inline кнопки подтверждения (нажал «Подтвердить» в боте → меняет статус в БД)
 
 ### Этап 4 — Монетизация
-14. `POST /api/subscription/create-payment` (YooKassa)
-15. `POST /api/subscription/webhook`
-16. Применение White Label: темы, логотип, убрать брендинг
+
+22. `POST /api/subscription/create-payment` (YooKassa) — создание платежа
+23. `POST /api/subscription/webhook` — обработка `succeeded` → `plan = 'pro'`
+24. Применение White Label: фронтенд читает `master.theme`, `master.app_name`, `master.show_branding` из ответа `/api/auth/init` и применяет CSS-переменные + меняет заголовок
+25. UI апгрейда: если мастер на free и пытается добавить 6-ю услугу → экран «Перейти на Pro»
 
 ### Этап 5 — Отзывы и аналитика
-17. `POST /api/bookings/{id}/review` + фото-отзыв
-18. Автоуведомление мастеру «Запрос отзыва» через 2ч после completion
-19. Аналитика для мастера: записи/месяц, выручка, топ-услуги
+
+26. `POST /api/bookings/{id}/review` + фото-отзыв в Supabase Storage
+27. Scheduled task (Vercel Cron или внешний cron): через 2ч после `status = 'completed'` → бот пишет клиенту запрос отзыва с deep link в Mini App
+28. Аналитика для мастера: записи/месяц, выручка, топ-услуги (агрегация на лету через Supabase RPC)
+29. Pagination для всех list-эндпоинтов (`?page=1&limit=20`) — добавить до публичного запуска
+
+---
+
+## 14. Что намеренно не вошло в текущий план (но нужно до production)
+
+| Тема | Почему важно | Когда добавлять |
+|------|-------------|-----------------|
+| **Rate limiting** | Без него любой может создать тысячи записей через API | Перед публичным запуском (Vercel Edge Middleware или Upstash Redis) |
+| **Pagination** | `GET /api/master/{id}/reviews` вернёт все 1000 отзывов без лимита | При Этапе 2, добавить `?page=&limit=` ко всем list-роутам |
+| **Audit log** | Мастер изменил расписание, удалил запись — нет истории | После Этапа 3 (таблица `audit_log` с `entity_type`, `entity_id`, `action`, `actor_id`, `diff`) |
+| **Soft delete везде** | Физическое удаление услуги сломает ссылки в старых bookings | Добавить `deleted_at TIMESTAMPTZ` к `services`, `portfolio_photos`, `service_photos`; все SELECT фильтруют `WHERE deleted_at IS NULL` |
+| **Напоминания за 24ч** | Cron-задача для уведомлений клиентов и мастеров | Этап 5, Vercel Cron: `0 9 * * *` → проверить записи на завтра → разослать |
+| **Обработка expired JWT** | Фронтенд должен уметь обновлять токен без перезапуска | Добавить `refresh_token` (TTL 30 дней) или просто повторять `/api/auth/init` при 401 |
