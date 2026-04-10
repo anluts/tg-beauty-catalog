@@ -6,7 +6,7 @@
 const App = (() => {
 
   // ─── Инициализация ─────────────────────────────────────────────────────────
-  async function init() {
+  function init() {
     // 1. Инициализируем Telegram WebApp
     TG.init();
 
@@ -23,29 +23,40 @@ const App = (() => {
     // 3. Рисуем shell (таб-бар + fallback-кнопки)
     _renderShell();
 
-    // 4. Авторизация через бэкенд (получаем JWT, загружаем данные мастера)
-    const authOk = await API.init();
-
-    if (authOk) {
-      // Загружаем реальные данные из БД
-      const data = await API.loadMasterData();
-      if (data) {
-        // Перезаписываем глобальные переменные реальными данными
-        _applyMasterData(data.master, data.services);
-      }
-    }
-    // Если authOk = false — работаем со статичными данными из data.js (demo)
-
-    // 5. Показываем стартовый экран
+    // 4. СРАЗУ показываем UI со статичными данными — никакого ожидания
     switchTab('catalog');
 
-    // 6. Онбординг при первом открытии, потом оффер
+    // 5. Онбординг при первом открытии, потом оффер
     if (Onboarding.shouldShow()) {
       Onboarding.show(() => {
         setTimeout(() => Offer.show(), 400);
       });
     } else {
       setTimeout(() => Offer.show(), 600);
+    }
+
+    // 6. Фоновая загрузка реальных данных из БД (не блокирует UI)
+    _loadRealDataInBackground();
+  }
+
+  // ─── Фоновая загрузка данных из API ───────────────────────────────────────
+  // Запускается ПОСЛЕ того как UI уже показан. Если API недоступен — ничего не ломается.
+  async function _loadRealDataInBackground() {
+    try {
+      const authOk = await API.init();
+      if (!authOk) return;
+
+      const data = await API.loadMasterData();
+      if (data) {
+        _applyMasterData(data.master, data.services);
+        // Обновляем текущий экран если он уже открыт
+        const tab = State.getActiveTab();
+        if (tab === 'catalog') Router.go('catalog', {}, false);
+        if (tab === 'master')  Router.go('master',  {}, false);
+      }
+    } catch (e) {
+      // Тихая ошибка — пользователь продолжает видеть статичные данные
+      console.warn('[App] Background data load failed:', e.message);
     }
   }
 
