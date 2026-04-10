@@ -894,7 +894,7 @@ PLAN_PRO_PRICE_RUB=990
 
 ## 13. Порядок разработки (этапы)
 
-### Этап 0 — Multi-tenant routing (делается ДО любого API)
+### Этап 0 — Multi-tenant routing ✅ ВЫПОЛНЕНО
 
 Фронтенд должен знать с каким мастером работает. Это решается один раз и не меняется.
 
@@ -930,18 +930,23 @@ if (!MASTER_ID) {
 Ссылка для клиентов: t.me/ваш_бот?startapp=550e8400-e29b-41d4-a716-446655440000
 ```
 
-### Этап 1 — Фундамент (без него ничего не работает)
+### Этап 1 — Фундамент ✅ ЧАСТИЧНО ВЫПОЛНЕНО
 
-1. Supabase: создать все таблицы (включая `webhook_secret` в `masters`), настроить RLS
-2. `POST /api/auth/init` — проверка initData, определение роли, выдача JWT
-3. Middleware `requireAuth` — проверка JWT для всех роутов кроме `/api/auth/*`
-4. `POST /api/auth/master-setup` — регистрация мастера через бота платформы
-5. `GET /api/master/{id}/services` — отдать услуги в Mini App (использует JWT)
-6. `GET /api/master/{id}/profile` — профиль мастера (тема, имя, аватар для White Label)
-7. Telegram webhook бота платформы: команда `/start` → онбординг → выдача `master_id`
-8. Telegram webhook каждого бота мастера: via `X-Telegram-Bot-Api-Secret-Token`
+1. ✅ Supabase: 10 таблиц, индексы, триггеры, RLS, Storage (masters + services)
+2. ✅ `POST /api/auth/init` — HMAC-SHA256 проверка initData, роль, JWT (tg-app/api/auth/init.js)
+3. ✅ Middleware `requireAuth` — проверка JWT внутри каждого роута (tg-app/api/_lib/jwt.js)
+4. ✅ Регистрация мастера: скрипт register-master.js + Platform Bot (backend/bot/platform.js)
+5. ✅ `GET /api/master` — профиль + услуги мастера по JWT (tg-app/api/master.js)
+6. ✅ Шифрование bot_token в БД: AES-256-GCM (tg-app/api/_lib/crypto.js)
+7. ⬜ Telegram webhook бота платформы (Platform Bot сделан на polling, webhook — следующий шаг)
+8. ⬜ Webhook каждого бота мастера: X-Telegram-Bot-Api-Secret-Token
 
-### Этап 2 — Записи
+**Зарегистрированный мастер:**
+- bot: @oz_beauty_bot (token: 7326226014:AAFx...)
+- master_id: `55849bef-cc4a-4c56-8528-7c56f6a50d3e`
+- plan: pro
+
+### Этап 2 — Записи ⬜ НЕ НАЧАТО
 
 9. `GET /api/master/{id}/slots?date=&service_id=` — генерация слотов (исправленный weekday)
 10. `POST /api/bookings` — создать запись + `ON CONFLICT DO NOTHING` + уведомить мастера
@@ -949,7 +954,7 @@ if (!MASTER_ID) {
 12. `PATCH /api/bookings/{id}/cancel` — отмена (проверяем что `>24ч` до записи)
 13. Фронтенд: обработка `409 SLOT_TAKEN` → автообновление слотов + сообщение пользователю
 
-### Этап 3 — Кабинет мастера в Mini App
+### Этап 3 — Кабинет мастера в Mini App ⬜ НЕ НАЧАТО
 
 14. Фронтенд: роутинг по роли — если `role === 'master'` в JWT → показываем кабинет
 15. Новые экраны: дашборд (записи сегодня/завтра), управление услугами, расписание, записи
@@ -960,14 +965,14 @@ if (!MASTER_ID) {
 20. `PATCH /api/master/me/bookings/{id}/confirm|reject|complete`
 21. Telegram inline кнопки подтверждения (нажал «Подтвердить» в боте → меняет статус в БД)
 
-### Этап 4 — Монетизация
+### Этап 4 — Монетизация ⬜ НЕ НАЧАТО
 
 22. `POST /api/subscription/create-payment` (YooKassa) — создание платежа
 23. `POST /api/subscription/webhook` — обработка `succeeded` → `plan = 'pro'`
 24. Применение White Label: фронтенд читает `master.theme`, `master.app_name`, `master.show_branding` из ответа `/api/auth/init` и применяет CSS-переменные + меняет заголовок
 25. UI апгрейда: если мастер на free и пытается добавить 6-ю услугу → экран «Перейти на Pro»
 
-### Этап 5 — Отзывы и аналитика
+### Этап 5 — Отзывы и аналитика ⬜ НЕ НАЧАТО
 
 26. `POST /api/bookings/{id}/review` + фото-отзыв в Supabase Storage
 27. Scheduled task (Vercel Cron или внешний cron): через 2ч после `status = 'completed'` → бот пишет клиенту запрос отзыва с deep link в Mini App
