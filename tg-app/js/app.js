@@ -6,7 +6,7 @@
 const App = (() => {
 
   // ─── Инициализация ─────────────────────────────────────────────────────────
-  function init() {
+  async function init() {
     // 1. Инициализируем Telegram WebApp
     TG.init();
 
@@ -23,10 +23,23 @@ const App = (() => {
     // 3. Рисуем shell (таб-бар + fallback-кнопки)
     _renderShell();
 
-    // 4. Показываем стартовый экран
+    // 4. Авторизация через бэкенд (получаем JWT, загружаем данные мастера)
+    const authOk = await API.init();
+
+    if (authOk) {
+      // Загружаем реальные данные из БД
+      const data = await API.loadMasterData();
+      if (data) {
+        // Перезаписываем глобальные переменные реальными данными
+        _applyMasterData(data.master, data.services);
+      }
+    }
+    // Если authOk = false — работаем со статичными данными из data.js (demo)
+
+    // 5. Показываем стартовый экран
     switchTab('catalog');
 
-    // 5. Онбординг при первом открытии, потом оффер
+    // 6. Онбординг при первом открытии, потом оффер
     if (Onboarding.shouldShow()) {
       Onboarding.show(() => {
         setTimeout(() => Offer.show(), 400);
@@ -34,6 +47,53 @@ const App = (() => {
     } else {
       setTimeout(() => Offer.show(), 600);
     }
+  }
+
+  // ─── Применяем данные из API к глобальным переменным ──────────────────────
+  // MASTER и SERVICES объявлены в data.js и используются экранами.
+  // Здесь мы перезаписываем их реальными данными из БД.
+  function _applyMasterData(masterFromApi, servicesFromApi) {
+    if (!masterFromApi) return;
+
+    // Обновляем объект MASTER (он объявлен в data.js как const — копируем свойства)
+    Object.assign(MASTER, {
+      name:        masterFromApi.name        || MASTER.name,
+      specialty:   masterFromApi.specialty   || MASTER.specialty,
+      city:        masterFromApi.city        || MASTER.city,
+      bio:         masterFromApi.bio         || MASTER.bio,
+      address:     masterFromApi.address     || MASTER.address,
+      metro:       masterFromApi.metro       || MASTER.metro,
+      hours:       masterFromApi.hours       || MASTER.hours,
+      phone:       masterFromApi.phone       || MASTER.phone,
+      rating:      masterFromApi.rating      || MASTER.rating,
+      reviewsCount: masterFromApi.reviews_count || MASTER.reviewsCount,
+      avatar_url:  masterFromApi.avatar_url  || null,
+    });
+
+    // Обновляем массив SERVICES
+    if (Array.isArray(servicesFromApi) && servicesFromApi.length > 0) {
+      // Очищаем и наполняем реальными услугами
+      SERVICES.length = 0;
+      servicesFromApi.forEach(s => {
+        SERVICES.push({
+          id:           s.id,
+          category:     s.category,
+          name:         s.name,
+          shortDesc:    s.short_desc || '',
+          description:  s.description || '',
+          duration:     s.duration,
+          price:        s.price,
+          rating:       s.rating || 0,
+          reviewsCount: s.reviews_count || 0,
+          gradient:     s.gradient || 'linear-gradient(135deg, #A78BFA 0%, #EC4899 100%)',
+          emoji:        s.emoji || '💅',
+          photos:       [], // фото загружаются отдельно по необходимости
+          includes:     [],
+        });
+      });
+    }
+
+    console.log(`[App] Loaded master: ${MASTER.name}, services: ${SERVICES.length}`);
   }
 
   // ─── Shell (постоянная часть UI) ───────────────────────────────────────────

@@ -1,2 +1,7 @@
 .env
+.env.local
 .DS_Store
+node_modules/
+tg-app/node_modules/
+tg-app/package-lock.json
+

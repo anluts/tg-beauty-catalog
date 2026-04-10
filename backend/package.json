@@ -1,0 +1,12 @@
+{
+  "name": "beauty-catalog-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "bot": "node bot/platform.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "dotenv": "^16.5.0"
+  }
+}
