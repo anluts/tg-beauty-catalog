@@ -3,7 +3,6 @@
 **Проект:** Beauty Master Platform  
 **Бот мастера:** @oz_beauty_bot  
 **Ссылка для клиентов:** `t.me/oz_beauty_bot?startapp=55849bef-cc4a-4c56-8528-7c56f6a50d3e`  
-**Прямая ссылка (старая):** https://t.me/oz_beauty_bot/app  
 **Production URL:** https://beauty-catalog-azure.vercel.app  
 **GitHub:** https://github.com/anluts/tg-beauty-catalog  
 **master_id:** `55849bef-cc4a-4c56-8528-7c56f6a50d3e`
@@ -36,6 +35,8 @@ tg-beauty-catalog/
 │           └── jwt.js             # JWT подпись и верификация
 ├── backend/
 │   ├── bot/platform.js            # Platform Bot — регистрация новых мастеров
+│   ├── ecosystem.config.js        # PM2 конфиг для Beget VPS
+│   ├── install.sh                 # Скрипт автоустановки на VPS
 │   ├── scripts/
 │   │   ├── register-master.js     # Скрипт: зарегистрировать мастера по токену бота
 │   │   └── seed-test-master.js    # Скрипт: создать тестовые данные в БД
@@ -48,7 +49,8 @@ tg-beauty-catalog/
 
 **Стек:**
 - Фронтенд: Vanilla JS (IIFE-модули), без фреймворков
-- Бэкенд: Vercel Serverless Functions (Node.js)
+- Бэкенд API: Vercel Serverless Functions (Node.js)
+- Platform Bot: Node.js long polling, деплой на Beget VPS
 - БД: Supabase (PostgreSQL + Storage)
 - Авторизация: Telegram initData → HMAC-SHA256 → JWT
 
@@ -86,38 +88,79 @@ tg-beauty-catalog/
 
 ---
 
-## 3. Локальный запуск (разработка)
+## 3. Серверная инфраструктура
+
+### Vercel (API + фронтенд)
+
+- **URL:** https://beauty-catalog-azure.vercel.app
+- **Что деплоится:** папка `tg-app/` (фронтенд + Serverless Functions)
+- **Переменные окружения:** заданы в Vercel Dashboard
+
+```bash
+# Деплой (из папки tg-app/)
+cd tg-app
+HTTPS_PROXY=http://191.102.148.189:9842 npx vercel --prod
+```
+
+### Beget VPS (Platform Bot)
+
+- **Сервер:** Admirable Rayne
+- **IP:** 84.54.31.175
+- **OS:** Ubuntu 24.04 LTS
+- **Тариф:** Simple (1 ядро, 1 ГБ RAM, 10 ГБ SSD) — 11 ₽/день
+- **SSH:** `ssh -i ~/.ssh/id_vps_beauty root@84.54.31.175`
+- **Файлы:** `/root/tg-beauty-catalog/backend/`
+- **Логи:** `/root/logs/beauty-bot.out.log`
+- **Менеджер процессов:** PM2
+
+**Статус деплоя:** ✅ VPS настроен, код загружен, PM2 установлен  
+**Ожидает:** `PLATFORM_BOT_TOKEN` — создать через @BotFather, записать в `/root/tg-beauty-catalog/backend/.env`
+
+```bash
+# Подключиться к серверу (с Mac):
+ssh -i ~/.ssh/id_vps_beauty root@84.54.31.175
+
+# Запустить бота (после заполнения .env):
+cd /root/tg-beauty-catalog/backend
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup   # выполнить выведенную команду для автозапуска
+
+# Полезные PM2 команды:
+pm2 status              # статус
+pm2 logs beauty-bot     # логи в реальном времени
+pm2 restart beauty-bot  # перезапуск
+```
+
+---
+
+## 4. Локальный запуск (разработка)
 
 ### Запуск фронтенда
 
 ```bash
 cd tg-app
 python3 -m http.server 3000
-# или
-npx serve -p 3000
 ```
 
 Открыть: `http://localhost:3000`
 
-> Без master_id в URL приложение работает с демо-данными из data.js (захардкоженная "Алина Петрова").  
+> Без master_id — демо-данные ("Алина Петрова").  
 > С master_id: `http://localhost:3000?master_id=55849bef-cc4a-4c56-8528-7c56f6a50d3e`
 
-### Запуск Platform Bot
+### Запуск Platform Bot локально
 
 ```bash
 cd backend
-npm install
 # Заполнить backend/.env: PLATFORM_BOT_TOKEN=...
 node bot/platform.js
 ```
 
 ---
 
-## 4. API эндпоинты
+## 5. API эндпоинты
 
 ### POST /api/auth/init
-
-Авторизация при открытии Mini App. Вызывается один раз, дальше используется JWT.
 
 ```
 Body:    { initData: string, master_id: string }
@@ -127,49 +170,27 @@ Body:    { initData: string, master_id: string }
 404:     мастер не найден
 ```
 
-**Как проверить:**
 ```bash
 curl -X POST https://beauty-catalog-azure.vercel.app/api/auth/init \
   -H "Content-Type: application/json" \
   -d '{"initData":"test","master_id":"55849bef-cc4a-4c56-8528-7c56f6a50d3e"}'
-# Ответ: {"error":"Invalid initData signature"} — правильно, "test" не валидная подпись
+# Ожидаемый ответ: {"error":"Invalid initData signature"}
 ```
 
 ### GET /api/master
-
-Возвращает профиль мастера и список услуг. Требует JWT.
 
 ```
 Headers: Authorization: Bearer <jwt>
 200 OK:  { master: {...}, services: [...] }
 401:     нет токена или токен просрочен
-404:     мастер не найден
 ```
 
 ---
 
-## 5. База данных (Supabase)
+## 6. База данных (Supabase)
 
 **Проект:** ktmblxavaieujivguemc  
-**URL:** https://ktmblxavaieujivguemc.supabase.co  
 **Dashboard:** https://supabase.com/dashboard/project/ktmblxavaieujivguemc
-
-**Таблицы (созданы в backend/db/schema.sql):**
-
-| Таблица | Назначение |
-|---------|-----------|
-| `masters` | Мастера: профиль, токен бота (зашифрован), тариф |
-| `services` | Услуги мастера (до 5 на free, безлимит на pro) |
-| `service_photos` | Фотографии услуг → Supabase Storage |
-| `portfolio_photos` | Портфолио мастера → Supabase Storage |
-| `schedule` | Расписание работы по дням недели |
-| `schedule_overrides` | Выходные и особые дни |
-| `clients` | Клиенты мастеров (идентифицируются по telegram_id) |
-| `bookings` | Записи клиентов |
-| `reviews` | Отзывы к услугам |
-| `subscriptions` | История платежей YooKassa |
-
-**Storage бакеты:** `masters` (аватары), `services` (фото услуг) — оба публичные
 
 **Зарегистрированный мастер:**
 ```
@@ -180,83 +201,43 @@ plan:      pro
 
 ---
 
-## 6. Деплой на Vercel
-
-```bash
-# Из папки tg-app/
-cd tg-app
-
-# Если сеть блокирует Vercel — через прокси:
-HTTPS_PROXY=http://191.102.148.189:9842 npx vercel --prod
-
-# Проверить что задеплоилось:
-curl -I https://beauty-catalog-azure.vercel.app/js/app.js
-# Ожидаемый ответ: HTTP/2 200
-```
-
-**Переменные окружения на Vercel (уже заданы):**
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `JWT_SECRET`
-- `JWT_TTL`
-- `ENCRYPTION_KEY`
-
----
-
 ## 7. Тест-кейсы
 
 ### TC-01 — Приложение открывается
 
 | # | Шаг | Ожидаемый результат |
 |---|-----|---------------------|
-| 1 | Открыть `https://beauty-catalog-azure.vercel.app` в браузере | Загружается каталог с демо-данными ("Алина Петрова") |
-| 2 | Открыть `https://beauty-catalog-azure.vercel.app?master_id=55849bef-cc4a-4c56-8528-7c56f6a50d3e` | Каталог загружается, в фоне идёт запрос к API |
-| 3 | Открыть `t.me/oz_beauty_bot/app` в Telegram | Mini App открывается |
-| 4 | Открыть `t.me/oz_beauty_bot?startapp=55849bef-cc4a-4c56-8528-7c56f6a50d3e` | Mini App открывается, пробует авторизоваться |
+| 1 | Открыть `https://beauty-catalog-azure.vercel.app` | Каталог с демо-данными |
+| 2 | Открыть с `?master_id=55849bef-...` | Каталог загружается, в фоне API-запрос |
+| 3 | Открыть `t.me/oz_beauty_bot?startapp=55849bef-...` | Mini App, авторизация через JWT |
 
-### TC-02 — API авторизация
-
-| # | Шаг | Ожидаемый результат |
-|---|-----|---------------------|
-| 1 | POST /api/auth/init без тела | 400 Bad Request |
-| 2 | POST /api/auth/init с неверным master_id | 404 Not Found |
-| 3 | POST /api/auth/init с невалидным initData | 401 Invalid initData signature |
-| 4 | Открыть Mini App через правильную ссылку в Telegram | 200 + JWT токен |
-
-### TC-03 — Каталог услуг
+### TC-02 — API
 
 | # | Шаг | Ожидаемый результат |
 |---|-----|---------------------|
-| 1 | Открыть приложение | Экран каталога виден СРАЗУ (не ждёт API) |
-| 2 | Фильтры по категориям | Маникюр / Педикюр / Дизайн / Наращивание / Брови |
-| 3 | Нажать на услугу | Экран услуги с ценой, длительностью, описанием |
-| 4 | Нажать «Записаться» | Wizard записи (3 шага) |
+| 1 | POST /api/auth/init без тела | 400 |
+| 2 | POST /api/auth/init с неверным master_id | 404 |
+| 3 | POST /api/auth/init с невалидным initData | 401 |
 
-### TC-04 — Онбординг и оффер
+### TC-03 — Каталог
 
 | # | Шаг | Ожидаемый результат |
 |---|-----|---------------------|
-| 1 | Первое открытие (localStorage пустой) | Через 0.6 сек онбординг с приветствием |
-| 2 | После онбординга | Через 0.4 сек оффер скидки 15% |
-| 3 | Повторное открытие | Онбординг и оффер НЕ показываются |
-
-**Сброс состояния:**
-```js
-// В консоли браузера:
-localStorage.clear(); location.reload();
-```
+| 1 | Открыть приложение | Экран виден СРАЗУ (не ждёт API) |
+| 2 | Фильтры по категориям | Работают |
+| 3 | Нажать на услугу → «Записаться» | Wizard записи (3 шага) |
 
 ---
 
 ## 8. Известные ограничения (MVP)
 
-| # | Ограничение | Где |
-|---|-------------|-----|
-| 1 | Записи сохраняются в localStorage, не в БД | wizard.js |
-| 2 | Расписание и слоты — демо-генерация | data.js |
-| 3 | Фото услуг — цветные заглушки (нет реальных фото) | data.js |
-| 4 | Platform Bot требует отдельного запуска (node bot/platform.js) | backend/bot/ |
-| 5 | Telegram ID мастера в БД = ID бота (нужно заменить на реальный) | masters.telegram_id |
+| # | Ограничение |
+|---|-------------|
+| 1 | Записи сохраняются в localStorage, не в БД |
+| 2 | Расписание и слоты — демо-генерация |
+| 3 | Platform Bot не запущен (нужен PLATFORM_BOT_TOKEN) |
+| 4 | Профиль мастера в БД не заполнен (имя, специализация) |
+| 5 | Telegram ID мастера в БД = ID бота, а не реальный TG ID |
 
 ---
 
@@ -269,16 +250,17 @@ localStorage.clear(); location.reload();
 - [x] API: /api/auth/init (JWT авторизация через Telegram HMAC)
 - [x] API: /api/master (профиль + услуги, защищён JWT)
 - [x] Шифрование токенов ботов (AES-256-GCM)
-- [x] Frontend api.js: загрузка реальных данных в фоне, без блокировки UI
-- [x] @oz_beauty_bot зарегистрирован в БД (master_id = 55849bef...)
-- [x] Platform Bot: код написан, ожидает PLATFORM_BOT_TOKEN
+- [x] Frontend api.js: загрузка реальных данных в фоне
+- [x] @oz_beauty_bot зарегистрирован в БД
+- [x] Beget VPS настроен: Ubuntu 24.04, Node.js 20, PM2, код задеплоен
+- [x] SSH-доступ к VPS через ключ (`~/.ssh/id_vps_beauty`)
+- [x] Platform Bot: код готов, ждёт PLATFORM_BOT_TOKEN
 
-### ⬜ Следующие шаги
+### ⬜ Ближайшие шаги (в порядке приоритета)
 
-- [ ] Заполнить профиль мастера (имя, специализация, адрес)
-- [ ] Добавить реальные услуги в БД через API
-- [ ] Запустить Platform Bot (нужен токен платформенного бота)
-- [ ] API: /api/master/{id}/slots — генерация слотов из расписания
-- [ ] API: POST /api/bookings — реальное бронирование в БД
-- [ ] Кабинет мастера в Mini App (управление услугами, расписанием)
-- [ ] Перенос на VPS (Beget) для ускорения в России
+1. **Создать платформенный бот** через @BotFather → получить токен → вставить в `/root/tg-beauty-catalog/backend/.env` → запустить PM2
+2. **Заполнить профиль мастера** в БД (имя, специализация, адрес, часы)
+3. **Добавить реальные услуги** в БД через API
+4. API: `/api/master/{id}/slots` — генерация слотов из расписания
+5. API: `POST /api/bookings` — реальное бронирование в БД
+6. Кабинет мастера в Mini App (управление услугами, расписанием)

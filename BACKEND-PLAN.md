@@ -938,8 +938,15 @@ if (!MASTER_ID) {
 4. ✅ Регистрация мастера: скрипт register-master.js + Platform Bot (backend/bot/platform.js)
 5. ✅ `GET /api/master` — профиль + услуги мастера по JWT (tg-app/api/master.js)
 6. ✅ Шифрование bot_token в БД: AES-256-GCM (tg-app/api/_lib/crypto.js)
-7. ⬜ Telegram webhook бота платформы (Platform Bot сделан на polling, webhook — следующий шаг)
-8. ⬜ Webhook каждого бота мастера: X-Telegram-Bot-Api-Secret-Token
+7. ✅ Beget VPS настроен: Ubuntu 24.04, Node.js 20, PM2, код задеплоен (`/root/tg-beauty-catalog/backend/`)
+8. ⬜ Platform Bot запущен в PM2 (ожидает PLATFORM_BOT_TOKEN — создать через @BotFather)
+9. ⬜ Webhook каждого бота мастера: X-Telegram-Bot-Api-Secret-Token
+
+**Beget VPS:**
+- IP: 84.54.31.175 (публичный, можно отключить после настройки)
+- SSH: `ssh -i ~/.ssh/id_vps_beauty root@84.54.31.175`
+- Код: `/root/tg-beauty-catalog/backend/`
+- Логи: `/root/logs/beauty-bot.out.log`
 
 **Зарегистрированный мастер:**
 - bot: @oz_beauty_bot (token: 7326226014:AAFx...)
